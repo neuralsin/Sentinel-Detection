@@ -90,6 +90,97 @@ def run_behavior_detection(video_source=0):
 
     cap.release()
     pose.close()
+import math
+
+def calculate_angle(a, b, c):
+    """Calculate angle between three points"""
+    a = np.array(a)  # First point
+    b = np.array(b)  # Mid point
+    c = np.array(c)  # End point
+
+    ba = a - b
+    bc = c - b
+
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+    return np.degrees(angle)
+
+def run_behavior_detection(video_source=0):
+    cap = cv2.VideoCapture(video_source)
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
+    global video_alert_flag
+
+    prev_torso_y = None
+    freeze_counter = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+
+        suspicious_behavior = False
+
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+
+            # Get key points (use normalized coordinates)
+            nose = [landmarks[mp_pose.PoseLandmark.NOSE].x, landmarks[mp_pose.PoseLandmark.NOSE].y]
+            left_shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER].y]
+            right_shoulder = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].x, landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER].y]
+            left_wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST].y]
+            right_wrist = [landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].x, landmarks[mp_pose.PoseLandmark.RIGHT_WRIST].y]
+            left_hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP].y]
+            right_hip = [landmarks[mp_pose.PoseLandmark.RIGHT_HIP].x, landmarks[mp_pose.PoseLandmark.RIGHT_HIP].y]
+
+            # Calculate torso height (average shoulder y - average hip y)
+            torso_height = ((left_shoulder[1] + right_shoulder[1]) / 2) - ((left_hip[1] + right_hip[1]) / 2)
+
+            # Detect if torso is suddenly low (fall or crouch)
+            if prev_torso_y is not None:
+                drop = prev_torso_y - torso_height
+                if drop > 0.15:  # Threshold for sudden drop (tweak if needed)
+                    suspicious_behavior = True
+                    cv2.putText(frame, "ALERT: Sudden fall/crouch detected", (10,60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            prev_torso_y = torso_height
+
+            # Detect raised hands (both wrists above shoulders)
+            if left_wrist[1] < left_shoulder[1] and right_wrist[1] < right_shoulder[1]:
+                suspicious_behavior = True
+                cv2.putText(frame, "ALERT: Hands raised detected", (10,90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Detect freezing (no big movement in nose y)
+            if prev_torso_y is not None:
+                nose_y = nose[1]
+                if abs(nose_y - prev_torso_y) < 0.005:
+                    freeze_counter += 1
+                    if freeze_counter > 30:  # roughly 1 second assuming ~30 FPS
+                        suspicious_behavior = True
+                        cv2.putText(frame, "ALERT: Freeze detected", (10,120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    freeze_counter = 0
+
+            mp.solutions.drawing_utils.draw_landmarks(
+                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
+            )
+
+        video_alert_flag = suspicious_behavior
+
+        cv2.putText(frame, "Behavior Detection Running", (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.imshow("Sentinel - Behavior Anomaly Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 # === YAMNet Audio Event Detection ===
 yamnet_model_handle = 'https://tfhub.dev/google/yamnet/1'
