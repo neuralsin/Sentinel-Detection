@@ -1,14 +1,27 @@
-
-
-from ultralytics import YOLO
 import cv2
+import threading
+import time
+import numpy as np
+import queue
+import sounddevice as sd
+import tensorflow as tf
+import tensorflow_hub as hub
+from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+import mediapipe as mp
+from plyer import notification
 
+# === GLOBAL FLAGS ===
+video_alert_flag = False
+audio_alert_flag = False
+
+# === YOLO + DeepSORT Video Detection & Tracking ===
 def run_detection_tracking(video_source=0):
-    model = YOLO('yolov8n.pt')  # YOLOv8 nano for speed
+    global video_alert_flag
+    model = YOLO('yolov8n.pt')  # YOLOv8 nano - lightweight af
     tracker = DeepSort(max_age=30)
-
     cap = cv2.VideoCapture(video_source)
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -21,10 +34,10 @@ def run_detection_tracking(video_source=0):
             conf = float(box.conf[0])
             cls = int(box.cls[0])
             if conf > 0.3:
-                # Deep SORT wants [x, y, width, height]
                 detections.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
 
         tracks = tracker.update_tracks(detections, frame=frame)
+        suspicious_found = False
         for track in tracks:
             if not track.is_confirmed():
                 continue
@@ -33,6 +46,11 @@ def run_detection_tracking(video_source=0):
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.putText(frame, f"ID:{track_id}", (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # Example suspicious logic: if detected class is person (cls==0), mark suspicious
+            if cls == 0 and conf > 0.5:
+                suspicious_found = True
+
+        video_alert_flag = suspicious_found
 
         cv2.imshow("Sentinel - Detection & Tracking", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -41,24 +59,9 @@ def run_detection_tracking(video_source=0):
     cap.release()
     cv2.destroyAllWindows()
 
-
-if __name__ == "__main__":
-    run_detection_tracking()
-
-
-import cv2
-import mediapipe as mp
-
+# === Mediapipe Pose Behavior Detection ===
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
-
-def get_pose_landmarks(frame):
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb)
-    if results.pose_landmarks:
-        # Return list of (x,y,z) normalized landmarks
-        return [(lm.x, lm.y, lm.z) for lm in results.pose_landmarks.landmark]
-    return None
 
 def run_behavior_detection(video_source=0):
     cap = cv2.VideoCapture(video_source)
@@ -68,17 +71,17 @@ def run_behavior_detection(video_source=0):
         if not ret:
             break
 
-        landmarks = get_pose_landmarks(frame)
-        if landmarks:
-            # Just drawing landmarks for now
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).pose_landmarks, mp_pose.POSE_CONNECTIONS
-            )
-            # Here you’d collect sequences of landmarks over time for behavior analysis (LSTM/Transformer)
-            # For now, just print a simple message
-            cv2.putText(frame, "Pose detected - track this shit for anomalies", (10,30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
 
+        if results.pose_landmarks:
+            mp.solutions.drawing_utils.draw_landmarks(
+                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
+            )
+            # This can be expanded with anomaly detection based on landmarks sequences
+
+        cv2.putText(frame, "Behavior Detection Running", (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
         cv2.imshow("Sentinel - Behavior Anomaly Detection", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -86,23 +89,10 @@ def run_behavior_detection(video_source=0):
     cap.release()
     cv2.destroyAllWindows()
 
-
-if __name__ == "__main__":
-    run_behavior_detection()
-
-
-import numpy as np
-import sounddevice as sd
-import tensorflow as tf
-import tensorflow_hub as hub
-import queue
-import time
-
-# Load YAMNet model from TF Hub
+# === YAMNet Audio Event Detection ===
 yamnet_model_handle = 'https://tfhub.dev/google/yamnet/1'
 yamnet_model = hub.load(yamnet_model_handle)
 
-# YAMNet class names (partial, you can extend)
 class_map_path = tf.keras.utils.get_file('yamnet_class_map.csv',
                                          'https://raw.githubusercontent.com/auditory/yamnet/master/yamnet_class_map.csv')
 class_names = []
@@ -110,10 +100,8 @@ with open(class_map_path) as f:
     for line in f.readlines()[1:]:
         class_names.append(line.strip().split(',')[2])
 
-# Audio params
 SAMPLE_RATE = 16000
-BUFFER_DURATION = 1.0  # seconds
-buffer_size = int(SAMPLE_RATE * BUFFER_DURATION)
+BUFFER_DURATION = 1.0
 audio_queue = queue.Queue()
 
 def audio_callback(indata, frames, time_info, status):
@@ -122,6 +110,7 @@ def audio_callback(indata, frames, time_info, status):
     audio_queue.put(indata.copy())
 
 def run_audio_detection():
+    global audio_alert_flag
     print("Starting audio event detection... Press Ctrl+C to stop")
 
     with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=audio_callback):
@@ -131,7 +120,6 @@ def run_audio_detection():
                     audio_chunk = audio_queue.get()
                     audio_chunk = np.squeeze(audio_chunk)
 
-                    # Run YAMNet
                     scores, embeddings, spectrogram = yamnet_model(audio_chunk)
                     scores_np = scores.numpy()
                     mean_scores = np.mean(scores_np, axis=0)
@@ -139,78 +127,54 @@ def run_audio_detection():
                     top_class = class_names[top_index]
                     top_score = mean_scores[top_index]
 
-                    # Threshold to catch loud shit only
-                    if top_score > 0.3 and top_class in ['Gunshot, gunfire',
-                                                         'Siren',
-                                                         'Glass breaking, smashing',
-                                                         'Scream']:
-                        print(f"[ALERT] Detected audio event: {top_class} with confidence {top_score:.2f}")
+                    alert_classes = ['Gunshot, gunfire',
+                                     'Siren',
+                                     'Glass breaking, smashing',
+                                     'Scream']
+
+                    if top_score > 0.3 and top_class in alert_classes:
+                        print(f"[ALERT] Audio detected: {top_class} ({top_score:.2f})")
+                        audio_alert_flag = True
+                    else:
+                        audio_alert_flag = False
 
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            print("Stopping audio event detection...")
+            print("Audio detection stopped.")
 
-if __name__ == "__main__":
-    run_audio_detection()
-
-
-import threading
-import time
-
-# Dummy placeholders for detection flags - replace these with your actual detection modules' outputs
-video_alert_flag = False
-audio_alert_flag = False
-
-# Simulated functions to update alert flags (in practice, connect these to your actual detection outputs)
-def video_detection_simulator():
-    global video_alert_flag
-    while True:
-        # Fake detection logic for demo: toggle alert every 10 sec
-        video_alert_flag = not video_alert_flag
-        print(f"[Video] Suspicious activity detected? {video_alert_flag}")
-        time.sleep(10)
-
-def audio_detection_simulator():
-    global audio_alert_flag
-    while True:
-        # Fake detection logic for demo: toggle alert every 7 sec
-        audio_alert_flag = not audio_alert_flag
-        print(f"[Audio] Suspicious sound detected? {audio_alert_flag}")
-        time.sleep(7)
-
-def fusion_engine():
-    while True:
-        # Basic fusion logic:
-        # Alert only if both video and audio detect suspicious shit simultaneously
-        if video_alert_flag and audio_alert_flag:
-            print("[FUSION ALERT] Suspicious activity CONFIRMED by video + audio.")
-            # Here you’d call your alert system (sms/email/push)
-        else:
-            print("[FUSION] No combined alert.")
-
-        time.sleep(2)
-
-if __name__ == "__main__":
-    # Run simulators and fusion engine concurrently
-    threading.Thread(target=video_detection_simulator, daemon=True).start()
-    threading.Thread(target=audio_detection_simulator, daemon=True).start()
-
-    fusion_engine()
-
-
-from plyer import notification
-import time
-
+# === Fusion Logic & Popup Alert ===
 def send_popup_alert(title, message):
     notification.notify(
         title=title,
         message=message,
         app_name="Sentinel",
-        timeout=5  # seconds the popup stays visible
+        timeout=5
     )
 
+def fusion_engine():
+    already_alerted = False
+    while True:
+        if video_alert_flag and audio_alert_flag:
+            if not already_alerted:
+                print("[FUSION ALERT] Suspicious activity CONFIRMED by video + audio.")
+                send_popup_alert("Sentinel Alert", "Suspicious behavior detected by video + audio!")
+                already_alerted = True
+        else:
+            if already_alerted:
+                print("[FUSION] Alert cleared.")
+            already_alerted = False
+
+        time.sleep(2)
+
+# === MAIN THREADS SETUP ===
 if __name__ == "__main__":
-    # Example: call this whenever you detect suspicious activity
-    send_popup_alert("Sentinel Alert", "Suspicious behavior detected: Running in restricted area!")
-    time.sleep(6)
-    send_popup_alert("Sentinel Alert", "Audio alert: Glass breaking detected!")
+    # Run video detection and tracking in its own thread
+    video_thread = threading.Thread(target=run_detection_tracking, args=(0,), daemon=True)
+    video_thread.start()
+
+    # Run audio detection in its own thread
+    audio_thread = threading.Thread(target=run_audio_detection, daemon=True)
+    audio_thread.start()
+
+    # Run fusion alert engine in main thread
+    fusion_engine()
