@@ -38,7 +38,7 @@ def run_detection_tracking(video_source=0):
             if conf > 0.3:
                 detections.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
                 # Suspicious logic inside here instead of track loop
-                if cls == 0 and conf > 0.5:
+                if cls == 0 and conf > 0.5:  # class 0 is person in COCO
                     suspicious_found = True
 
         tracks = tracker.update_tracks(detections, frame=frame)
@@ -61,37 +61,8 @@ def run_detection_tracking(video_source=0):
     cap.release()
     cv2.destroyAllWindows()
 
+
 # === Mediapipe Pose Behavior Detection ===
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
-
-def run_behavior_detection(video_source=0):
-    cap = cv2.VideoCapture(video_source)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb)
-
-        if results.pose_landmarks:
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
-            )
-            # Expand for anomaly detection here
-
-        cv2.putText(frame, "Behavior Detection Running", (10,30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        cv2.imshow("Sentinel - Behavior Anomaly Detection", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    pose.close()
-import math
-
 def calculate_angle(a, b, c):
     """Calculate angle between three points"""
     a = np.array(a)  # First point
@@ -147,8 +118,6 @@ def run_behavior_detection(video_source=0):
                     cv2.putText(frame, "ALERT: Sudden fall/crouch detected", (10,60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            prev_torso_y = torso_height
-
             # Detect raised hands (both wrists above shoulders)
             if left_wrist[1] < left_shoulder[1] and right_wrist[1] < right_shoulder[1]:
                 suspicious_behavior = True
@@ -167,11 +136,14 @@ def run_behavior_detection(video_source=0):
                 else:
                     freeze_counter = 0
 
+            prev_torso_y = torso_height
+
             mp.solutions.drawing_utils.draw_landmarks(
                 frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
             )
 
-        video_alert_flag = suspicious_behavior
+        with flag_lock:
+            video_alert_flag = suspicious_behavior
 
         cv2.putText(frame, "Behavior Detection Running", (10,30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -181,6 +153,7 @@ def run_behavior_detection(video_source=0):
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 # === YAMNet Audio Event Detection ===
 yamnet_model_handle = 'https://tfhub.dev/google/yamnet/1'
@@ -194,7 +167,6 @@ with open(class_map_path) as f:
         class_names.append(line.strip().split(',')[2])
 
 SAMPLE_RATE = 16000
-BUFFER_DURATION = 1.0
 audio_queue = queue.Queue()
 
 def audio_callback(indata, frames, time_info, status):
@@ -209,14 +181,14 @@ def run_audio_detection():
     with sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=audio_callback):
         try:
             while True:
-                if audio_queue.qsize() > 0:
+                if not audio_queue.empty():
                     audio_chunk = audio_queue.get()
                     audio_chunk = np.squeeze(audio_chunk)
 
                     # YAMNet expects [N,] float32 waveform at 16kHz, so:
                     if audio_chunk.dtype != np.float32:
                         audio_chunk = audio_chunk.astype(np.float32)
-                    # If needed, pad/trim audio_chunk to length
+                    # Pad/trim audio_chunk to length SAMPLE_RATE
                     if len(audio_chunk) < SAMPLE_RATE:
                         audio_chunk = np.pad(audio_chunk, (0, SAMPLE_RATE - len(audio_chunk)), mode='constant')
                     else:
@@ -244,6 +216,7 @@ def run_audio_detection():
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print("Audio detection stopped.")
+
 
 # === Fusion Logic & Popup Alert ===
 def send_popup_alert(title, message):
@@ -273,12 +246,16 @@ def fusion_engine():
 
         time.sleep(2)
 
+
 # === MAIN THREADS SETUP ===
 if __name__ == "__main__":
+    # You can run either detection+tracking OR behavior detection, or both in separate threads
     video_thread = threading.Thread(target=run_detection_tracking, args=(0,), daemon=True)
-    video_thread.start()
-
+    behavior_thread = threading.Thread(target=run_behavior_detection, args=(0,), daemon=True)
     audio_thread = threading.Thread(target=run_audio_detection, daemon=True)
+
+    video_thread.start()
+    behavior_thread.start()
     audio_thread.start()
 
     fusion_engine()
