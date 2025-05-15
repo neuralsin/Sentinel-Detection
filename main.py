@@ -11,9 +11,10 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 import mediapipe as mp
 from plyer import notification
 
-# === GLOBAL FLAGS ===
+# === THREADSAFE FLAGS & LOCK ===
 video_alert_flag = False
 audio_alert_flag = False
+flag_lock = threading.Lock()
 
 # === YOLO + DeepSORT Video Detection & Tracking ===
 def run_detection_tracking(video_source=0):
@@ -29,15 +30,18 @@ def run_detection_tracking(video_source=0):
 
         results = model(frame)[0]
         detections = []
+        suspicious_found = False
         for box in results.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
             cls = int(box.cls[0])
             if conf > 0.3:
                 detections.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
+                # Suspicious logic inside here instead of track loop
+                if cls == 0 and conf > 0.5:
+                    suspicious_found = True
 
         tracks = tracker.update_tracks(detections, frame=frame)
-        suspicious_found = False
         for track in tracks:
             if not track.is_confirmed():
                 continue
@@ -46,11 +50,9 @@ def run_detection_tracking(video_source=0):
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.putText(frame, f"ID:{track_id}", (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            # Example suspicious logic: if detected class is person (cls==0), mark suspicious
-            if cls == 0 and conf > 0.5:
-                suspicious_found = True
 
-        video_alert_flag = suspicious_found
+        with flag_lock:
+            video_alert_flag = suspicious_found
 
         cv2.imshow("Sentinel - Detection & Tracking", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -78,7 +80,7 @@ def run_behavior_detection(video_source=0):
             mp.solutions.drawing_utils.draw_landmarks(
                 frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
             )
-            # This can be expanded with anomaly detection based on landmarks sequences
+            # Expand for anomaly detection here
 
         cv2.putText(frame, "Behavior Detection Running", (10,30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
@@ -87,7 +89,7 @@ def run_behavior_detection(video_source=0):
             break
 
     cap.release()
-    cv2.destroyAllWindows()
+    pose.close()
 
 # === YAMNet Audio Event Detection ===
 yamnet_model_handle = 'https://tfhub.dev/google/yamnet/1'
@@ -120,6 +122,15 @@ def run_audio_detection():
                     audio_chunk = audio_queue.get()
                     audio_chunk = np.squeeze(audio_chunk)
 
+                    # YAMNet expects [N,] float32 waveform at 16kHz, so:
+                    if audio_chunk.dtype != np.float32:
+                        audio_chunk = audio_chunk.astype(np.float32)
+                    # If needed, pad/trim audio_chunk to length
+                    if len(audio_chunk) < SAMPLE_RATE:
+                        audio_chunk = np.pad(audio_chunk, (0, SAMPLE_RATE - len(audio_chunk)), mode='constant')
+                    else:
+                        audio_chunk = audio_chunk[:SAMPLE_RATE]
+
                     scores, embeddings, spectrogram = yamnet_model(audio_chunk)
                     scores_np = scores.numpy()
                     mean_scores = np.mean(scores_np, axis=0)
@@ -132,11 +143,12 @@ def run_audio_detection():
                                      'Glass breaking, smashing',
                                      'Scream']
 
-                    if top_score > 0.3 and top_class in alert_classes:
-                        print(f"[ALERT] Audio detected: {top_class} ({top_score:.2f})")
-                        audio_alert_flag = True
-                    else:
-                        audio_alert_flag = False
+                    with flag_lock:
+                        if top_score > 0.3 and top_class in alert_classes:
+                            print(f"[ALERT] Audio detected: {top_class} ({top_score:.2f})")
+                            audio_alert_flag = True
+                        else:
+                            audio_alert_flag = False
 
                 time.sleep(0.1)
         except KeyboardInterrupt:
@@ -154,7 +166,11 @@ def send_popup_alert(title, message):
 def fusion_engine():
     already_alerted = False
     while True:
-        if video_alert_flag and audio_alert_flag:
+        with flag_lock:
+            video_flag = video_alert_flag
+            audio_flag = audio_alert_flag
+
+        if video_flag and audio_flag:
             if not already_alerted:
                 print("[FUSION ALERT] Suspicious activity CONFIRMED by video + audio.")
                 send_popup_alert("Sentinel Alert", "Suspicious behavior detected by video + audio!")
@@ -168,13 +184,10 @@ def fusion_engine():
 
 # === MAIN THREADS SETUP ===
 if __name__ == "__main__":
-    # Run video detection and tracking in its own thread
     video_thread = threading.Thread(target=run_detection_tracking, args=(0,), daemon=True)
     video_thread.start()
 
-    # Run audio detection in its own thread
     audio_thread = threading.Thread(target=run_audio_detection, daemon=True)
     audio_thread.start()
 
-    # Run fusion alert engine in main thread
     fusion_engine()
